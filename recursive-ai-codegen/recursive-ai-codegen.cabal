@@ -1,0 +1,45 @@
+cabal-version: 3.0
+name: recursive-ai-codegen
+version: 0.1.0.0
+build-type: Simple
+license: MIT
+
+common executable-settings
+  hs-source-dirs:
+      app
+      src
+  other-modules:
+      AST
+      Config
+      DataSet
+      FunctionGen
+      Generate
+      Holes
+      LLM
+      Memory
+      Pretty
+      Prompt
+      Score
+      TestRunner
+      TrainLog
+  build-depends:
+      base >= 4.14 && < 5
+    , aeson
+    , bytestring
+    , http-conduit
+    , process
+    , text
+  default-language: Haskell2010
+  ghc-options: -Wall
+
+executable recursive-ai-codegen
+  import: executable-settings
+  main-is: Main.hs
+
+executable fake
+  import: executable-settings
+  main-is: Main.hs
+
+executable llm
+  import: executable-settings
+  main-is: Main.hs
