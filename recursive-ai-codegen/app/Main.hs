@@ -5,9 +5,11 @@ import DataSet
 import FunctionGen
 import Generate
 import Holes
+import LLM
 import Memory
 import Pretty
 import Score
+import Task
 import TestRunner
 import TrainLog
 import System.Environment (getArgs, getProgName)
@@ -172,30 +174,38 @@ printExpansionDecision stepNumber decision =
         ++ show (scoredScore (expansionChosenScore decision))
         ++ "    source="
         ++ scoredSource (expansionChosenScore decision)
+        ++ "    origin="
+        ++ expansionChosenOrigin decision
+        ++ memoryPatternText (expansionChosenPatternName decision)
     )
     >> putStrLn ("        " ++ prettyExpr (expansionNewExpr decision))
+
+memoryPatternText :: String -> String
+memoryPatternText name =
+  if null name then "" else "    pattern=" ++ name
 
 runFunctionDemo :: String -> IO ()
 runFunctionDemo mode = do
   putStrLn ""
-  runFunctionTask mode "generatedSum :: [Int] -> Int" generatedSumEnv TInt generatedSumSpec generatedSumSourcePath generatedSumTests
+  runFunctionTask mode sumTask "generatedSum :: [Int] -> Int" generatedSumSpec generatedSumSourcePath generatedSumTests
   putStrLn ""
-  runFunctionTask mode "generatedLength :: [Int] -> Int" generatedListEnv TInt generatedLengthSpec generatedLengthSourcePath generatedLengthTests
+  runFunctionTask mode lengthTask "generatedLength :: [Int] -> Int" generatedLengthSpec generatedLengthSourcePath generatedLengthTests
 
-runFunctionTask :: String -> String -> Env -> Type -> (Expr -> FunctionSpec) -> FilePath -> [TestCase] -> IO ()
-runFunctionTask mode label env goalType makeSpec sourcePath tests = do
+runFunctionTask :: String -> TaskSpec -> String -> (Expr -> FunctionSpec) -> FilePath -> [TestCase] -> IO ()
+runFunctionTask mode task label makeSpec sourcePath tests = do
   putStrLn ("Function generation demo: " ++ label)
-  printAvailableMemoryPatterns env goalType
-  holeBody <- bodyFromHoleExpansion mode env functionExpansionSteps goalType
+  printAvailableMemoryPatterns (taskEnv task) (taskGoalType task)
+  holeBody <- bodyFromTaskHoleExpansion mode task functionExpansionSteps
   putStrLn ("Initial hole-generated body: " ++ prettyExpr holeBody)
-  selectedSpec <- chooseFunctionSpecWithFeedback (makeSpec holeBody) sourcePath tests
+  selectedSpec <- chooseFunctionSpecWithFeedback mode task (makeSpec holeBody) sourcePath tests
   let source = functionSourceWithTests selectedSpec tests
   putStrLn "Generated function source:"
   putStrLn source
   result <- runFunctionTests sourcePath source
   putStrLn ("Function tests: " ++ if testPassed result then "PASS" else "FAIL")
   printTestOutput result
-  appendTrainingRow trainingLogPath (functionTestRow mode selectedSpec sourcePath source tests result)
+  bodyScore <- scoreFunctionBody mode task (functionBody selectedSpec)
+  appendTrainingRow trainingLogPath (functionTestRowForTask mode task selectedSpec sourcePath source tests result bodyScore)
 
 printAvailableMemoryPatterns :: Env -> Type -> IO ()
 printAvailableMemoryPatterns env goalType =
@@ -205,48 +215,152 @@ printAvailableMemoryPatterns env goalType =
     patterns ->
       putStrLn ("Memory patterns: " ++ commaList (map patternName patterns))
 
-bodyFromHoleExpansion :: String -> Env -> Int -> Type -> IO Expr
-bodyFromHoleExpansion mode env maxSteps goalType =
+bodyFromTaskHoleExpansion :: String -> TaskSpec -> Int -> IO Expr
+bodyFromTaskHoleExpansion mode task maxSteps =
+  expandTaskWithLogging mode task maxSteps 1 (initialHole (taskGoalType task))
+
+expandTaskWithLogging :: String -> TaskSpec -> Int -> Int -> Expr -> IO Expr
+expandTaskWithLogging mode task stepsLeft stepNumber expr =
+  if stepsLeft <= 0 || not (hasHoles expr)
+    then return expr
+    else do
+      maybeDecision <- nextTaskExpansionDecision mode task expr
+      case maybeDecision of
+        Nothing ->
+          return expr
+        Just decision -> do
+          appendTrainingRow trainingLogPath (expansionRowForTask mode task decision)
+          printTaskExpansionDecision stepNumber task decision
+          expandTaskWithLogging mode task (stepsLeft - 1) (stepNumber + 1) (expansionNewExpr decision)
+
+nextTaskExpansionDecision :: String -> TaskSpec -> Expr -> IO (Maybe ExpansionDecision)
+nextTaskExpansionDecision mode task expr =
   case mode of
     "llm" ->
-      expandFullyLLM env maxSteps goalType
+      expandStepLLMDecisionForTask task expr
     _ ->
-      return (expandFullyFake env maxSteps goalType)
+      return (expandStepFakeDecisionForTask task expr)
 
-chooseFunctionSpecWithFeedback :: FunctionSpec -> FilePath -> [TestCase] -> IO FunctionSpec
-chooseFunctionSpecWithFeedback initialSpec sourcePath tests = do
+printTaskExpansionDecision :: Int -> TaskSpec -> ExpansionDecision -> IO ()
+printTaskExpansionDecision stepNumber task decision =
+  putStrLn
+    ( "Task step "
+        ++ show stepNumber
+        ++ " ("
+        ++ taskName task
+        ++ "): hole "
+        ++ show (expansionHoleId decision)
+        ++ " :: "
+        ++ prettyType (expansionHoleType decision)
+        ++ " -> "
+        ++ prettyExpr (expansionChosenReplacement decision)
+        ++ "    score="
+        ++ show (scoredScore (expansionChosenScore decision))
+        ++ "    source="
+        ++ scoredSource (expansionChosenScore decision)
+        ++ "    origin="
+        ++ expansionChosenOrigin decision
+        ++ memoryPatternText (expansionChosenPatternName decision)
+    )
+    >> putStrLn ("        " ++ prettyExpr (expansionNewExpr decision))
+
+chooseFunctionSpecWithFeedback :: String -> TaskSpec -> FunctionSpec -> FilePath -> [TestCase] -> IO FunctionSpec
+chooseFunctionSpecWithFeedback mode task initialSpec sourcePath tests = do
   initialResult <- runFunctionTests sourcePath (functionSourceWithTests initialSpec tests)
+  candidates <- candidateFunctionSpecsForTask mode task initialSpec
   if testPassed initialResult
-    then return initialSpec
+    then do
+      maybeSimplerSpec <- firstPassingCandidate sourcePath tests candidates
+      case maybeSimplerSpec of
+        Nothing ->
+          return initialSpec
+        Just simplerSpec ->
+          if exprSize (functionBody simplerSpec) <= exprSize (functionBody initialSpec)
+            then do
+              putStrLn "A smaller complete candidate passed tests; using it."
+              return simplerSpec
+            else return initialSpec
     else do
       putStrLn "Initial body did not pass tests; trying complete generated candidates."
-      tryCandidateSpecs initialSpec sourcePath tests (candidateFunctionSpecs initialSpec)
+      maybeCandidate <- firstPassingCandidate sourcePath tests candidates
+      case maybeCandidate of
+        Nothing ->
+          return initialSpec
+        Just candidateSpec ->
+          return candidateSpec
 
-tryCandidateSpecs :: FunctionSpec -> FilePath -> [TestCase] -> [FunctionSpec] -> IO FunctionSpec
-tryCandidateSpecs fallbackSpec sourcePath tests candidates =
+firstPassingCandidate :: FilePath -> [TestCase] -> [FunctionSpec] -> IO (Maybe FunctionSpec)
+firstPassingCandidate sourcePath tests candidates =
   case candidates of
     [] ->
-      return fallbackSpec
+      return Nothing
     candidateSpec : rest -> do
       result <- runFunctionTests sourcePath (functionSourceWithTests candidateSpec tests)
       if testPassed result
-        then return candidateSpec
-        else tryCandidateSpecs fallbackSpec sourcePath tests rest
+        then return (Just candidateSpec)
+        else firstPassingCandidate sourcePath tests rest
 
-candidateFunctionSpecs :: FunctionSpec -> [FunctionSpec]
-candidateFunctionSpecs spec =
-  map makeSpec (uniqueExprs completeBodies)
+candidateFunctionSpecsForTask :: String -> TaskSpec -> FunctionSpec -> IO [FunctionSpec]
+candidateFunctionSpecsForTask mode task spec = do
+  scoredBodies <- scoreFunctionCandidateBodies mode task completeBodies
+  return (map makeSpec (map scoredExpr (sortScored scoredBodies)))
   where
     completeBodies :: [Expr]
     completeBodies =
-      filter (not . hasHoles)
-        ( patternCandidates (functionArgs spec) (functionReturnType spec)
-            ++ allCandidates (functionArgs spec) 1 (functionReturnType spec)
+      uniqueExprs
+        ( filter (not . hasHoles)
+            ( patternCandidates (taskEnv task) (taskGoalType task)
+                ++ allCandidates (taskEnv task) 1 (taskGoalType task)
+            )
         )
 
     makeSpec :: Expr -> FunctionSpec
     makeSpec body =
       spec { functionBody = body }
+
+scoreFunctionCandidateBodies :: String -> TaskSpec -> [Expr] -> IO [ScoredExpr]
+scoreFunctionCandidateBodies mode task bodies =
+  case mode of
+    "llm" -> do
+      canUseLLM <- canUseLLMScoring
+      if canUseLLM
+        then scoreExprBatchLLMForTask FunctionBodyScoring task bodies
+        else return (map (scoreExprFakeForTask FunctionBodyScoring task) bodies)
+    _ ->
+      return (map (scoreExprFakeForTask FunctionBodyScoring task) bodies)
+
+scoreFunctionBody :: String -> TaskSpec -> Expr -> IO ScoredExpr
+scoreFunctionBody mode task body =
+  case mode of
+    "llm" -> do
+      canUseLLM <- canUseLLMScoring
+      if canUseLLM
+        then scoreExprLLMForTask FunctionBodyScoring task body
+        else return (scoreExprFakeForTask FunctionBodyScoring task body)
+    _ ->
+      return (scoreExprFakeForTask FunctionBodyScoring task body)
+
+sortScored :: [ScoredExpr] -> [ScoredExpr]
+sortScored scoredValues =
+  case scoredValues of
+    [] ->
+      []
+    pivot : rest ->
+      sortScored better ++ [pivot] ++ sortScored worse
+      where
+        better :: [ScoredExpr]
+        better =
+          [ scored
+          | scored <- rest
+          , scoredScore scored > scoredScore pivot
+          ]
+
+        worse :: [ScoredExpr]
+        worse =
+          [ scored
+          | scored <- rest
+          , scoredScore scored <= scoredScore pivot
+          ]
 
 uniqueExprs :: [Expr] -> [Expr]
 uniqueExprs exprs =

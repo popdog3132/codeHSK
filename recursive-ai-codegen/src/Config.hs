@@ -9,6 +9,7 @@ data LLMConfig = LLMConfig
   { llmBaseURL :: String
   , llmModel :: String
   , llmMaxTokens :: Int
+  , llmParallelRequests :: Int
   } deriving (Show, Eq)
 
 readLLMConfig :: IO LLMConfig
@@ -16,11 +17,13 @@ readLLMConfig = do
   baseURL <- readEnvWithDefault "LLM_BASE_URL" defaultBaseURL
   model <- readEnvWithDefault "LLM_MODEL" defaultModel
   maxTokens <- readIntEnvWithDefault "LLM_MAX_TOKENS" defaultMaxTokens
+  parallelRequests <- readIntEnvWithDefault "LLM_PARALLEL_REQUESTS" defaultParallelRequests
   return
     LLMConfig
       { llmBaseURL = baseURL
       , llmModel = model
       , llmMaxTokens = maxTokens
+      , llmParallelRequests = max 1 parallelRequests
       }
 
 readEnvWithDefault :: String -> String -> IO String
@@ -54,3 +57,7 @@ defaultModel =
 defaultMaxTokens :: Int
 defaultMaxTokens =
   256
+
+defaultParallelRequests :: Int
+defaultParallelRequests =
+  8

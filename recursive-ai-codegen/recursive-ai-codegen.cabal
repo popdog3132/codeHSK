@@ -19,7 +19,9 @@ common executable-settings
       Memory
       Pretty
       Prompt
+      ScoringContext
       Score
+      Task
       TestRunner
       TrainLog
   build-depends:

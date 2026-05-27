@@ -14,6 +14,12 @@ module Holes
   , expandStepFakeDecision
   , expandStepLLMDecision
   , expandStepLLMDecisionWith
+  , expandStepFakeDecisionForTask
+  , expandStepLLMDecisionForTask
+  , expandStepLLMDecisionWithTask
+  , expandStepDecisionWithScorer
+  , expandFullyFakeForTask
+  , expandFullyLLMForTask
   ) where
 
 import AST
@@ -21,6 +27,7 @@ import DataSet
 import LLM
 import Memory
 import Score
+import Task
 import Data.List (sortBy)
 
 data ReplacementCandidate = ReplacementCandidate
@@ -219,32 +226,90 @@ expandFullyLLM env maxSteps goalType = do
             Just decision ->
               expandFullyLLMWith canUseLLM (steps - 1) (expansionNewExpr decision)
 
+expandFullyFakeForTask :: TaskSpec -> Int -> Expr
+expandFullyFakeForTask task maxSteps =
+  expandFullyWithStep step maxSteps (initialHole (taskGoalType task))
+  where
+    step :: Expr -> Maybe Expr
+    step expr =
+      fmap expansionNewExpr (expandStepFakeDecisionForTask task expr)
+
+expandFullyLLMForTask :: TaskSpec -> Int -> IO Expr
+expandFullyLLMForTask task maxSteps = do
+  canUseLLM <- canUseLLMScoring
+  expandFullyLLMWithTask canUseLLM maxSteps (initialHole (taskGoalType task))
+  where
+    expandFullyLLMWithTask :: Bool -> Int -> Expr -> IO Expr
+    expandFullyLLMWithTask canUseLLM steps expr =
+      if steps <= 0 || not (hasHoles expr)
+        then return expr
+        else do
+          maybeDecision <- expandStepLLMDecisionWithTask canUseLLM task expr
+          case maybeDecision of
+            Nothing ->
+              return expr
+            Just decision ->
+              expandFullyLLMWithTask canUseLLM (steps - 1) (expansionNewExpr decision)
+
 expandStepFakeDecision :: Env -> Expr -> Maybe ExpansionDecision
 expandStepFakeDecision env expr =
-  buildExpansionDecision env expr (scoreExprFake goalType)
+  buildExpansionDecision env expr (scoreExprFakeWithContext HoleExpansionScoring goalType)
   where
     goalType :: Type
     goalType =
       exprType expr
+
+expandStepFakeDecisionForTask :: TaskSpec -> Expr -> Maybe ExpansionDecision
+expandStepFakeDecisionForTask task expr =
+  buildExpansionDecision (taskEnv task) expr (scoreExprFakeForTask HoleExpansionScoring task)
 
 expandStepLLMDecision :: Env -> Expr -> IO (Maybe ExpansionDecision)
 expandStepLLMDecision env expr = do
   canUseLLM <- canUseLLMScoring
   expandStepLLMDecisionWith canUseLLM env expr
 
+expandStepLLMDecisionForTask :: TaskSpec -> Expr -> IO (Maybe ExpansionDecision)
+expandStepLLMDecisionForTask task expr = do
+  canUseLLM <- canUseLLMScoring
+  expandStepLLMDecisionWithTask canUseLLM task expr
+
 expandStepLLMDecisionWith :: Bool -> Env -> Expr -> IO (Maybe ExpansionDecision)
 expandStepLLMDecisionWith canUseLLM env expr =
-  buildExpansionDecisionIO env expr scoreCandidate
+  case firstHole expr of
+    Nothing ->
+      return Nothing
+    Just (holeId, holeType) -> do
+      let replacements = holeExpansionCandidates env (nextHoleId expr) holeType
+      let resultExprs =
+            [ replaceHole holeId (replacementExpr candidate) expr
+            | candidate <- replacements
+            ]
+      scoredValues <-
+        if canUseLLM
+          then scoreExprBatchLLMWithContext HoleExpansionScoring env goalType resultExprs
+          else return (map (scoreExprFallbackWithContext HoleExpansionScoring goalType) resultExprs)
+      return (chooseExpansion expr holeId holeType (zip replacements scoredValues))
   where
     goalType :: Type
     goalType =
       exprType expr
 
-    scoreCandidate :: Expr -> IO ScoredExpr
-    scoreCandidate candidate =
-      if canUseLLM
-        then scoreExprLLM env goalType candidate
-        else return (scoreExprFallback goalType candidate)
+expandStepLLMDecisionWithTask :: Bool -> TaskSpec -> Expr -> IO (Maybe ExpansionDecision)
+expandStepLLMDecisionWithTask canUseLLM task expr =
+  case firstHole expr of
+    Nothing ->
+      return Nothing
+    Just (holeId, holeType) -> do
+      let replacements = holeExpansionCandidates (taskEnv task) (nextHoleId expr) holeType
+      let resultExprs =
+            [ replaceHole holeId (replacementExpr candidate) expr
+            | candidate <- replacements
+            ]
+      scoredValues <-
+        if canUseLLM
+          then scoreExprBatchLLMForTask HoleExpansionScoring task resultExprs
+          else return (map (scoreExprFakeForTask HoleExpansionScoring task) resultExprs)
+      return (chooseExpansion expr holeId holeType (zip replacements scoredValues))
 
 buildExpansionDecision :: Env -> Expr -> (Expr -> ScoredExpr) -> Maybe ExpansionDecision
 buildExpansionDecision env expr scoreCandidate =
@@ -262,23 +327,9 @@ buildExpansionDecision env expr scoreCandidate =
         scoreReplacement candidate =
           (candidate, scoreCandidate (replaceHole holeId (replacementExpr candidate) expr))
 
-buildExpansionDecisionIO :: Env -> Expr -> (Expr -> IO ScoredExpr) -> IO (Maybe ExpansionDecision)
-buildExpansionDecisionIO env expr scoreCandidate =
-  case firstHole expr of
-    Nothing ->
-      return Nothing
-    Just (holeId, holeType) -> do
-      scoredCandidates <- mapM scoreReplacement replacements
-      return (chooseExpansion expr holeId holeType scoredCandidates)
-      where
-        replacements :: [ReplacementCandidate]
-        replacements =
-          holeExpansionCandidates env (nextHoleId expr) holeType
-
-        scoreReplacement :: ReplacementCandidate -> IO (ReplacementCandidate, ScoredExpr)
-        scoreReplacement candidate = do
-          scored <- scoreCandidate (replaceHole holeId (replacementExpr candidate) expr)
-          return (candidate, scored)
+expandStepDecisionWithScorer :: Env -> Expr -> (Expr -> ScoredExpr) -> Maybe ExpansionDecision
+expandStepDecisionWithScorer =
+  buildExpansionDecision
 
 chooseExpansion :: Expr -> Int -> Type -> [(ReplacementCandidate, ScoredExpr)] -> Maybe ExpansionDecision
 chooseExpansion original holeId holeType scoredCandidates =

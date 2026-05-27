@@ -16,6 +16,7 @@ import Data.Aeson
   , object
   , withObject
   , (.:)
+  , (.:?)
   , (.=)
   )
 import qualified Data.ByteString.Lazy as BL
@@ -24,13 +25,14 @@ import Data.Char (isDigit)
 import Data.List (isInfixOf)
 import qualified Data.Text as T
 import Network.HTTP.Simple
+import System.Environment (lookupEnv)
 import System.IO (hPutStrLn, stderr)
 
 data ChatResponse = ChatResponse [Choice]
 
-data Choice = Choice Message
+data Choice = Choice Message (Maybe T.Text)
 
-data Message = Message T.Text
+data Message = Message T.Text (Maybe T.Text)
 
 instance FromJSON ChatResponse where
   parseJSON =
@@ -41,11 +43,14 @@ instance FromJSON Choice where
   parseJSON =
     withObject "Choice" $ \value ->
       Choice <$> value .: "message"
+        <*> value .:? "finish_reason"
 
 instance FromJSON Message where
   parseJSON =
-    withObject "Message" $ \value ->
-      Message <$> value .: "content"
+    withObject "Message" $ \value -> do
+      content <- value .:? "content"
+      reasoningContent <- value .:? "reasoning_content"
+      return (Message (maybe "" id content) reasoningContent)
 
 scoreWithLLM :: String -> IO (Maybe Double)
 scoreWithLLM prompt = do
@@ -63,7 +68,7 @@ scoreWithLLM prompt = do
 
 canUseLLMScoring :: IO Bool
 canUseLLMScoring = do
-  maybeScore <- scoreWithLLM "Return only the number 50. Do not include words, JSON, markdown, or explanation."
+  maybeScore <- scoreWithLLM "Return only JSON matching this shape exactly: {\"score\":50}. Do not include markdown or explanation."
   case maybeScore of
     Nothing ->
       return False
@@ -80,9 +85,20 @@ requestLLMScore config prompt = do
           )
   response <- httpLBS request
   let statusCode = getResponseStatusCode response
+      responseBody = getResponseBody response
+  logDebugResponse responseBody
   if statusCode < 200 || statusCode >= 300
-    then return (Left (httpErrorMessage statusCode (getResponseBody response)))
-    else return (decodeScore (getResponseBody response))
+    then return (Left (httpErrorMessage statusCode responseBody))
+    else return (decodeScore responseBody)
+
+logDebugResponse :: BL.ByteString -> IO ()
+logDebugResponse responseBody = do
+  debug <- lookupEnv "LLM_DEBUG_RESPONSE"
+  case debug of
+    Just "1" ->
+      hPutStrLn stderr ("LLM raw response: " ++ take 3000 (BL8.unpack responseBody))
+    _ ->
+      return ()
 
 requestBody :: LLMConfig -> String -> BL.ByteString
 requestBody config prompt =
@@ -141,16 +157,42 @@ scoreFromResponse (ChatResponse choices) =
   case choices of
     [] ->
       Left "response had no choices"
-    Choice (Message content) : _ ->
+    Choice (Message content reasoningContent) finishReason : _ ->
       case parseStructuredScore content of
         Just score ->
           Right (clampScore score)
         Nothing ->
           case parseFirstNumber (T.unpack content) of
-            Nothing ->
-              Left ("response did not contain a score; content was " ++ show (take 160 (T.unpack content)))
             Just score ->
               Right (clampScore score)
+            Nothing ->
+              case reasoningContent >>= parseStructuredScore of
+                Just score ->
+                  Right (clampScore score)
+                Nothing ->
+                  Left
+                    ( "response did not contain a score"
+                        ++ finishReasonText finishReason
+                        ++ "; content was "
+                        ++ show (take 160 (T.unpack content))
+                        ++ reasoningContentText reasoningContent
+                    )
+
+finishReasonText :: Maybe T.Text -> String
+finishReasonText finishReason =
+  case finishReason of
+    Nothing ->
+      ""
+    Just reason ->
+      "; finish_reason=" ++ T.unpack reason
+
+reasoningContentText :: Maybe T.Text -> String
+reasoningContentText reasoningContent =
+  case reasoningContent of
+    Nothing ->
+      ""
+    Just text ->
+      "; reasoning_content was " ++ show (take 160 (T.unpack text))
 
 newtype ScoreResponse = ScoreResponse Double
 

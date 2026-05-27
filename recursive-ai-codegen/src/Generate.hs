@@ -31,7 +31,7 @@ search env depth goalType =
 
     sortedCandidates :: [ScoredExpr]
     sortedCandidates =
-      sortBy compareScoredExpr (map (scoreExprFake goalType) candidates)
+      sortBy compareScoredExpr (map (scoreExprFakeWithContext SearchScoring goalType) candidates)
 
     bestCandidate :: Maybe ScoredExpr
     bestCandidate =
@@ -47,8 +47,8 @@ searchIO env depth goalType = do
   canUseLLM <- canUseLLMScoring
   scoredCandidates <-
     if canUseLLM
-      then mapM (scoreExprLLM env goalType) candidates
-      else return (map (scoreExprFallback goalType) candidates)
+      then scoreExprBatchLLMWithContext SearchScoring env goalType candidates
+      else return (map (scoreExprFallbackWithContext SearchScoring goalType) candidates)
   let sortedCandidates = sortBy compareScoredExpr scoredCandidates
   return
     SearchResult
